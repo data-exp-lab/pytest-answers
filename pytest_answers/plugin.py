@@ -1,8 +1,6 @@
 import os
-import sys
+import hashlib
 import inspect
-import tempfile
-from pathlib import Path
 from functools import wraps
 
 import h5py
@@ -76,7 +74,6 @@ class AnswerComparison:
             msg = self.compare_answer_to_store(item, result, self.results_dir)
 
             if msg is not None:
-                sys.stderr.write("ala\n")
                 pytest.fail(msg, pytrace=False)
 
         if item.cls is not None:
@@ -95,27 +92,52 @@ class AnswerComparison:
         """
         Generate a unique name for the hash for this test.
         """
-        return f"{item.module.__name__}.{item.name}"
+        subdir = os.path.dirname(item.location[0])
+        fname = f"{item.module.__name__}.{item.name}"
+        return os.path.join(subdir, fname)
 
     def get_baseline_answer(self, item, result_dir):
         filename = self.generate_test_name(item) + ".h5"
-        with h5py.File(os.path.join(result_dir, filename), "r") as f:
-            return f["data"][:]
+        fullpath = os.path.join(result_dir, filename)
+        if not os.path.exists(fullpath):
+            pytest.fail(f"Answer '{filename}' does not exist", pytrace=False)
+        with h5py.File(fullpath, "r") as f:
+            if len(f.keys()) > 1:
+                return {k: f[k][()] for k in f.keys()}
+            else:
+                return f["data"][()]
 
     def compare_answer_to_store(self, item, result, result_dir):
         reference = self.get_baseline_answer(item, result_dir)
         try:
-            np.testing.assert_array_equal(reference, result)
+            if isinstance(result, (dict, bytes)):
+                assert reference == result  # TODO: be smarter about it
+            elif isinstance(result, str):  # Strings are stored as bytes
+                assert reference.decode() == result
+            else:
+                np.testing.assert_array_equal(reference, result)
         except AssertionError as exc:
             return str(exc)
 
     def store_answer(self, item, answer):
-        marker = item.get_closest_marker("answer_test")
+        # marker = item.get_closest_marker("answer_test")
         # get some extra options from marker if necessary
 
         if not os.path.exists(self.store_dir):
-            os.makedirs(self.store_dir)  # TODO: make it thread-safe
+            os.makedirs(self.store_dir, exist_ok=True)
 
         filename = self.generate_test_name(item) + ".h5"
-        with h5py.File(os.path.join(self.store_dir, filename), "a") as f:
-            f.create_dataset("data", data=answer)
+        fullpath = os.path.join(self.store_dir, filename)
+        if not os.path.isdir(os.path.dirname(fullpath)):
+            os.makedirs(os.path.dirname(fullpath), exist_ok=True)
+
+        with h5py.File(fullpath, "a") as f:
+            if isinstance(answer, dict):
+                for k, v in answer.items():
+                    f.create_dataset(k, data=v)
+                    if isinstance(v, np.ndarray):
+                        ds.attrs["hash"] = hashlib.md5(v.tobytes()).hexdigest()
+            else:
+                ds = f.create_dataset("data", data=answer)
+                if isinstance(answer, np.ndarray):
+                    ds.attrs["hash"] = hashlib.md5(answer.tobytes()).hexdigest()
