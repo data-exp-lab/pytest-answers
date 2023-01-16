@@ -42,6 +42,15 @@ def pytest_configure(config):
         )
 
 
+def pytest_collection_modifyitems(config, items):
+    if config.getoption("--answers"):
+        return
+    skip_answer_test = pytest.mark.skip(reason="need --answers option to run")
+    for item in items:
+        if "answer_test" in item.keywords:
+            item.add_marker(skip_answer_test)
+
+
 class AnswerComparison:
     def __init__(self, config, results_dir=None, store_dir=None):
         self.config = config
@@ -134,7 +143,7 @@ class AnswerComparison:
         with h5py.File(fullpath, "a") as f:
             if isinstance(answer, dict):
                 for k, v in answer.items():
-                    f.create_dataset(k, data=v)
+                    ds = f.create_dataset(k, data=v)
                     if isinstance(v, np.ndarray):
                         ds.attrs["hash"] = hashlib.md5(v.tobytes()).hexdigest()
             else:
