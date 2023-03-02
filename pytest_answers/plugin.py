@@ -1,7 +1,5 @@
 import os
 import hashlib
-import inspect
-from functools import wraps
 
 import h5py
 import numpy as np
@@ -50,6 +48,28 @@ def pytest_collection_modifyitems(config, items):
         if "answer_test" in item.keywords:
             item.add_marker(skip_answer_test)
 
+def generate_test_name(item):
+    """
+    Generate a unique name for the hash for this test.
+    """
+    subdir = item.module.__name__.replace(".", "/")
+    if item.cls is not None:
+        fname = f"{item.cls.__name__}.{item.name}"
+    else:
+        fname = f"{item.name}"
+    return os.path.join(subdir, fname)
+
+
+def wrap_data_interceptor(plugin, item):
+    if item.get_closest_marker("answer_test") is not None:
+        test_name = generate_test_name(item)
+
+        def answer_interceptor(store, obj):
+            def wrapper(*args, **kwargs):
+                store.return_value[test_name] = obj(*args, **kwargs)
+            return wrapper
+        item.obj = answer_interceptor(plugin, item.obj)
+
 
 class AnswerComparison:
     def __init__(self, config, results_dir=None, store_dir=None):
@@ -60,35 +80,46 @@ class AnswerComparison:
         # if not self.results_dir:
         #    self.results_dir = Path(tempfile.mkdtemp(dir=self.results_dir))
         self._generated_hash_library = {}
+        self.return_value = {}
 
-    def pytest_runtest_setup(self, item):
+    @pytest.hookimpl(hookwrapper=True)
+    def pytest_runtest_call(self, item):
         marker = item.get_closest_marker("answer_test")
 
         if marker is None:
+            yield
             return
 
-        original = item.function
+        # Run test and get the resulting array
+        wrap_data_interceptor(self, item)
+        yield
+        test_name = generate_test_name(item)
+        if test_name not in self.return_value:
+            # Test function did not complete successfully
+            return
+        answer = self.return_value[test_name]
 
-        @wraps(item.function)
-        def item_function_wrapper(*args, **kwargs):
-            if inspect.ismethod(original):
-                result = original.__func__(*args, **kwargs)
-            else:
-                result = original(*args, **kwargs)
+        summary = {
+            "status": None,
+            "status_msg": None,
+        }
 
-            # Generate answers
-            if self.store_dir is not None:
-                self.store_answer(item, result)
+        if self.store_dir is not None:
+            summary["status"] = "skipped"
+            summary['status_msg'] = "Skipped test, since generating answer."
+            self.store_answer(item, answer)
+            pytest.skip(summary['status_msg'])
 
-            msg = self.compare_answer_to_store(item, result, self.results_dir)
-
+        else:  # self.store_dir is None:
+            # compare shit
+            msg = self.compare_answer_to_store(item, answer, self.results_dir)
             if msg is not None:
                 pytest.fail(msg, pytrace=False)
 
-        if item.cls is not None:
-            setattr(item.cls, item.function.__name__, item_function_wrapper)
-        else:
-            item.obj = item_function_wrapper
+        #if item.cls is not None:
+        #    setattr(item.cls, item.function.__name__, item_function_wrapper)
+        ##else:
+        #    item.obj = item_function_wrapper
 
     def pytest_unconfigure(self, config):
         """
@@ -97,16 +128,8 @@ class AnswerComparison:
         # if self.generate_hash_library is not None:
         print("Do something here")
 
-    def generate_test_name(self, item):
-        """
-        Generate a unique name for the hash for this test.
-        """
-        subdir = os.path.dirname(item.location[0])
-        fname = f"{item.module.__name__}.{item.name}"
-        return os.path.join(subdir, fname)
-
     def get_baseline_answer(self, item, result_dir):
-        filename = self.generate_test_name(item) + ".h5"
+        filename = generate_test_name(item) + ".h5"
         fullpath = os.path.join(result_dir, filename)
         if not os.path.exists(fullpath):
             pytest.fail(f"Answer '{filename}' does not exist", pytrace=False)
@@ -119,7 +142,11 @@ class AnswerComparison:
     def compare_answer_to_store(self, item, result, result_dir):
         reference = self.get_baseline_answer(item, result_dir)
         try:
-            if isinstance(result, (dict, bytes)):
+            if isinstance(result, dict):  # assume dict of np.arrays
+                for key in result:
+                    assert key in reference
+                    np.testing.assert_array_equal(reference[key], result[key])
+            elif isinstance(result, bytes):
                 assert reference == result  # TODO: be smarter about it
             elif isinstance(result, str):  # Strings are stored as bytes
                 assert reference.decode() == result
@@ -135,7 +162,7 @@ class AnswerComparison:
         if not os.path.exists(self.store_dir):
             os.makedirs(self.store_dir, exist_ok=True)
 
-        filename = self.generate_test_name(item) + ".h5"
+        filename = generate_test_name(item) + ".h5"
         fullpath = os.path.join(self.store_dir, filename)
         if not os.path.isdir(os.path.dirname(fullpath)):
             os.makedirs(os.path.dirname(fullpath), exist_ok=True)
